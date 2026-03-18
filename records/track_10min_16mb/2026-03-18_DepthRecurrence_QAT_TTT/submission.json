@@ -1,0 +1,18 @@
+{
+    "author": "nicol",
+    "github_id": "",
+    "date": "2026-03-18",
+    "run_id": "depth_recurrence_qat_ttt",
+    "val_loss": null,
+    "val_bpb": null,
+    "pre_quant_val_loss": null,
+    "pre_quant_val_bpb": null,
+    "bytes_total": null,
+    "bytes_code": null,
+    "bytes_model_int8_zlib": null,
+    "steps_completed": null,
+    "total_train_time_ms": null,
+    "step_avg_ms": null,
+    "peak_memory_mib": null,
+    "notes": "3 shared blocks x 5 loops = 15 effective layers. QAT INT8 from step 500. TTT with 3 SGD steps at eval. Pending first run on H100."
+}
