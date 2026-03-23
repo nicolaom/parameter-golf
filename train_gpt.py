@@ -1058,8 +1058,10 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    sys.stdout.flush()
 
     # MODEL + OPTIMIZER SETUP
+    log0("creating model..."); sys.stdout.flush()
     def make_model() -> GPT:
         m = GPT(
             vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -1077,8 +1079,11 @@ def main() -> None:
         return m
 
     base_model = make_model()
+    log0(f"model created, params:{sum(p.numel() for p in base_model.parameters())}"); sys.stdout.flush()
     use_compile = not bool(int(os.environ.get("NO_COMPILE", "0")))
+    log0(f"compile:{use_compile}"); sys.stdout.flush()
     compiled_model = torch.compile(base_model, dynamic=False) if use_compile else base_model
+    log0("compile done"); sys.stdout.flush()
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split
