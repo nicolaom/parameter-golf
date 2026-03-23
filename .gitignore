@@ -10,3 +10,6 @@ data/docs_selected.jsonl
 .venv
 logs/
 .claude/
+CLAUDE.md
+PLANO_COMPETICAO.md
+records/PESQUISA_HYPERPARAMS.md

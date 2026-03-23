@@ -73,9 +73,22 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # SwiGLU activation (replaces ReLU^2 MLP). Use MLP_MULT=1 with SWIGLU=1.
+    swiglu = bool(int(os.environ.get("SWIGLU", "0")))
+
+    # Train short, eval long: decouple eval sequence length from training.
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "0"))  # 0 = use train_seq_len
+
+    # Mulligan seed search: try multiple seeds, pick the best one.
+    mulligan_seeds = int(os.environ.get("MULLIGAN_SEEDS", "0"))  # 0 = disabled
+    mulligan_seconds = float(os.environ.get("MULLIGAN_SECONDS", "60"))
+
+    # Cosine warmdown schedule (replaces linear warmdown).
+    cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "0")))
+
     # QAT (Quantization-Aware Training).
     qat_enabled = int(os.environ.get("QAT_ENABLED", 0))
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.2))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.75))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -248,19 +261,21 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    eval_seq_len: int = 0,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    seq_len = eval_seq_len if eval_seq_len > 0 else args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, seq_len={seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -271,11 +286,11 @@ def eval_val(
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
+            raw_start = batch_seq_start * seq_len
+            raw_end = batch_seq_end * seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
@@ -313,22 +328,18 @@ def eval_val_ttt(
     ttt_lr: float,
     ttt_steps: int,
     ttt_params: str,
+    eval_seq_len: int = 0,
 ) -> tuple[float, float]:
-    """Evaluation with test-time training: cumulative self-supervised adaptation.
-
-    For each validation batch the model first takes gradient steps on the
-    cross-entropy loss (adapting a small subset of parameters), then measures
-    loss/BPB with the adapted weights. Adaptation is cumulative — the model
-    keeps improving as it processes more validation data.
-    """
+    """Evaluation with test-time training: cumulative self-supervised adaptation."""
+    seq_len = eval_seq_len if eval_seq_len > 0 else args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank for TTT; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
 
@@ -362,11 +373,11 @@ def eval_val_ttt(
     model.train()
     for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
         batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
+        raw_start = batch_seq_start * seq_len
+        raw_end = batch_seq_end * seq_len + 1
         local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-        x = local[:-1].reshape(-1, args.train_seq_len)
-        y = local[1:].reshape(-1, args.train_seq_len)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
 
         # TTT: adapt on this batch
         for _ in range(ttt_steps):
@@ -769,6 +780,19 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SwiGLUMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        hidden = mlp_mult * dim
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(F.silu(self.gate(x)) * self.fc(x))
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -779,13 +803,14 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         value_residual: bool = False,
+        swiglu: bool = False,
     ):
         super().__init__()
         self.value_residual = value_residual
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, value_residual=value_residual)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = SwiGLUMLP(dim, mlp_mult) if swiglu else MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -821,6 +846,7 @@ class GPT(nn.Module):
         value_residual: bool = False,
         num_unique_blocks: int = 0,
         recurrence_loops: int = 1,
+        swiglu: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -848,7 +874,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                      value_residual=value_residual)
+                      value_residual=value_residual, swiglu=swiglu)
                 for _ in range(self.num_unique_blocks)
             ]
         )
@@ -1007,7 +1033,8 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    actual_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    val_tokens = load_validation_tokens(args.val_files, actual_eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -1019,26 +1046,71 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        value_residual=args.value_residual,
-        num_unique_blocks=args.num_unique_blocks,
-        recurrence_loops=args.recurrence_loops,
-    ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(base_model)
+    def make_model() -> GPT:
+        m = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            value_residual=args.value_residual, num_unique_blocks=args.num_unique_blocks,
+            recurrence_loops=args.recurrence_loops, swiglu=args.swiglu,
+        ).to(device).bfloat16()
+        for mod in m.modules():
+            if isinstance(mod, CastedLinear):
+                mod.float()
+        restore_low_dim_params_to_fp32(m)
+        return m
+
+    # Mulligan seed search: try several seeds, pick the one with lowest quick val loss.
+    if args.mulligan_seeds > 0:
+        time_per_seed = args.mulligan_seconds / args.mulligan_seeds
+        best_seed, best_loss = args.seed, float("inf")
+        for idx in range(args.mulligan_seeds):
+            seed_candidate = idx * 7 + 13
+            torch.manual_seed(seed_candidate)
+            torch.cuda.manual_seed_all(seed_candidate)
+            trial_model = make_model()
+            trial_compiled = torch.compile(trial_model, dynamic=False, fullgraph=True)
+            trial_wrapped = DDP(trial_compiled, device_ids=[local_rank], broadcast_buffers=False) if distributed else trial_compiled
+            trial_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+            trial_opt = torch.optim.Adam(trial_model.parameters(), lr=args.matrix_lr, fused=True)
+            trial_t0 = time.perf_counter()
+            trial_wrapped.train()
+            while time.perf_counter() - trial_t0 < time_per_seed * 0.7:
+                trial_opt.zero_grad(set_to_none=True)
+                tx, ty = trial_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    tloss = trial_wrapped(tx, ty)
+                tloss.backward()
+                trial_opt.step()
+            # Quick 5-batch validation
+            trial_wrapped.eval()
+            vl_sum, vl_cnt = 0.0, 0
+            with torch.inference_mode():
+                total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+                for bi in range(min(5, total_seqs)):
+                    rs, re = bi * args.train_seq_len, (bi + 1) * args.train_seq_len + 1
+                    vt = val_tokens[rs:re].to(device=device, dtype=torch.int64)
+                    vx, vy = vt[:-1].unsqueeze(0), vt[1:].unsqueeze(0)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        vl_sum += trial_wrapped(vx, vy).item()
+                    vl_cnt += 1
+            avg_vl = vl_sum / max(vl_cnt, 1)
+            log0(f"mulligan seed:{seed_candidate} val_loss:{avg_vl:.4f}")
+            if avg_vl < best_loss:
+                best_loss, best_seed = avg_vl, seed_candidate
+            del trial_model, trial_compiled, trial_wrapped, trial_opt, trial_loader
+            torch.cuda.empty_cache()
+        log0(f"mulligan winner: seed={best_seed} val_loss={best_loss:.4f}")
+        args.seed = best_seed
+
+    # Set seed for model creation
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    base_model = make_model()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1111,6 +1183,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.swiglu:
+        log0("swiglu:enabled")
+    if args.eval_seq_len > 0:
+        log0(f"eval_seq_len:{actual_eval_seq_len} (train_seq_len:{args.train_seq_len})")
+    if args.cosine_warmdown:
+        log0("cosine_warmdown:enabled")
     if args.value_residual:
         log0("value_residual:enabled")
     if args.lawa_enabled:
@@ -1137,11 +1215,15 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+            linear_val = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        else:
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            linear_val = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if args.cosine_warmdown and linear_val < 1.0:
+            return 0.5 * (1.0 + math.cos(math.pi * (1.0 - linear_val)))
+        return linear_val
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1190,16 +1272,9 @@ def main() -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
+                args, model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                eval_seq_len=actual_eval_seq_len,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1303,6 +1378,7 @@ def main() -> None:
         lawa_val_loss, lawa_val_bpb = eval_val(
             args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            eval_seq_len=actual_eval_seq_len,
         )
         log0(f"LAWA val_loss:{lawa_val_loss:.4f} val_bpb:{lawa_val_bpb:.4f}")
 
@@ -1362,32 +1438,15 @@ def main() -> None:
         )
         log0(f"TTT enabled: lr={args.ttt_lr} steps={args.ttt_steps} params={args.ttt_params} n_ttt_params={ttt_n_params}")
         q_val_loss, q_val_bpb = eval_val_ttt(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            args.ttt_lr,
-            args.ttt_steps,
-            args.ttt_params,
+            args, base_model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            args.ttt_lr, args.ttt_steps, args.ttt_params, eval_seq_len=actual_eval_seq_len,
         )
     else:
         q_val_loss, q_val_bpb = eval_val(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            eval_seq_len=actual_eval_seq_len,
         )
     torch.cuda.synchronize()
     ttt_tag = f" ttt_lr:{args.ttt_lr} ttt_steps:{args.ttt_steps} ttt_params:{args.ttt_params}" if args.ttt_enabled else ""
