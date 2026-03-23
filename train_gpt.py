@@ -1077,7 +1077,8 @@ def main() -> None:
         return m
 
     base_model = make_model()
-    compiled_model = torch.compile(base_model, dynamic=False)
+    use_compile = not bool(int(os.environ.get("NO_COMPILE", "0")))
+    compiled_model = torch.compile(base_model, dynamic=False) if use_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split
