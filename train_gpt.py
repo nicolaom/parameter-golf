@@ -73,6 +73,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "0"))  # 0 = use train_seq_len
+
     # QAT (Quantization-Aware Training).
     qat_enabled = int(os.environ.get("QAT_ENABLED", 0))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.2))
@@ -100,6 +102,17 @@ class Hyperparameters:
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 5))
     lawa_interval = int(os.environ.get("LAWA_INTERVAL", 200))
+
+    # SmearGate: learnable token-mixing gate applied before transformer blocks.
+    smear_gate = bool(int(os.environ.get("SMEAR_GATE", "0")))
+
+    # BigramHash: hash-based bigram embedding added to token embeddings.
+    bigram_hash = bool(int(os.environ.get("BIGRAM_HASH", "0")))
+    bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", "10240"))
+    bigram_embed_dim = int(os.environ.get("BIGRAM_EMBED_DIM", "128"))
+
+    # Cosine warmdown: replace linear warmdown with cosine schedule.
+    cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "0")))
 
     # Test-time training (TTT) — self-supervised adaptation during final evaluation.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
@@ -248,19 +261,21 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    eval_seq_len: int = 0,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    seq_len = eval_seq_len if eval_seq_len > 0 else args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, seq_len={seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -271,11 +286,11 @@ def eval_val(
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
+            raw_start = batch_seq_start * seq_len
+            raw_end = batch_seq_end * seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
@@ -313,6 +328,7 @@ def eval_val_ttt(
     ttt_lr: float,
     ttt_steps: int,
     ttt_params: str,
+    eval_seq_len: int = 0,
 ) -> tuple[float, float]:
     """Evaluation with test-time training: cumulative self-supervised adaptation.
 
@@ -321,14 +337,15 @@ def eval_val_ttt(
     loss/BPB with the adapted weights. Adaptation is cumulative — the model
     keeps improving as it processes more validation data.
     """
+    seq_len = eval_seq_len if eval_seq_len > 0 else args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank for TTT; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
 
@@ -362,11 +379,11 @@ def eval_val_ttt(
     model.train()
     for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
         batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
+        raw_start = batch_seq_start * seq_len
+        raw_end = batch_seq_end * seq_len + 1
         local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-        x = local[:-1].reshape(-1, args.train_seq_len)
-        y = local[1:].reshape(-1, args.train_seq_len)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
 
         # TTT: adapt on this batch
         for _ in range(ttt_steps):
@@ -769,6 +786,34 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
+class BigramHash(nn.Module):
+    def __init__(self, hash_size: int, embed_dim: int, model_dim: int):
+        super().__init__()
+        self.hash_size = hash_size
+        self.embed = nn.Embedding(hash_size, embed_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(embed_dim, model_dim, bias=False)
+        nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+    def forward(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.hash_size - 1
+        h = torch.zeros_like(t, dtype=torch.long)
+        h[..., 0] = mod
+        h[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return self.proj(self.embed(h)) * self.scale.to(dtype=self.embed.weight.dtype)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -821,6 +866,10 @@ class GPT(nn.Module):
         value_residual: bool = False,
         num_unique_blocks: int = 0,
         recurrence_loops: int = 1,
+        smear_gate: bool = False,
+        bigram_hash: bool = False,
+        bigram_hash_size: int = 10240,
+        bigram_embed_dim: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -830,6 +879,8 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.value_residual = value_residual
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.smear = SmearGate(model_dim) if smear_gate else None
+        self.bigram = BigramHash(bigram_hash_size, bigram_embed_dim, model_dim) if bigram_hash else None
         # Depth recurrence (LoopLM-style): share num_unique_blocks, loop recurrence_loops times.
         if num_unique_blocks > 0 and recurrence_loops > 1:
             self.num_unique_blocks = num_unique_blocks
@@ -872,7 +923,11 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1007,7 +1062,8 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    actual_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    val_tokens = load_validation_tokens(args.val_files, actual_eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -1034,12 +1090,17 @@ def main() -> None:
         value_residual=args.value_residual,
         num_unique_blocks=args.num_unique_blocks,
         recurrence_loops=args.recurrence_loops,
+        smear_gate=args.smear_gate,
+        bigram_hash=args.bigram_hash,
+        bigram_hash_size=args.bigram_hash_size,
+        bigram_embed_dim=args.bigram_embed_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    use_compile = not bool(int(os.environ.get("NO_COMPILE", "0")))
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1062,9 +1123,17 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     if base_model.layer_embeds is not None:
         scalar_params.append(base_model.layer_embeds)
+    if base_model.smear is not None:
+        scalar_params.append(base_model.smear.gate)
+    if base_model.bigram is not None:
+        scalar_params.append(base_model.bigram.scale)
+        matrix_params.append(base_model.bigram.proj.weight)
+    token_params = [base_model.tok_emb.weight]
+    if base_model.bigram is not None:
+        token_params.append(base_model.bigram.embed.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1137,11 +1206,15 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+            linear_val = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        else:
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            linear_val = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if args.cosine_warmdown and linear_val < 1.0:
+            return 0.5 * (1.0 + math.cos(math.pi * (1.0 - linear_val)))
+        return linear_val
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1200,6 +1273,7 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                eval_seq_len=actual_eval_seq_len,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1303,6 +1377,7 @@ def main() -> None:
         lawa_val_loss, lawa_val_bpb = eval_val(
             args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            eval_seq_len=actual_eval_seq_len,
         )
         log0(f"LAWA val_loss:{lawa_val_loss:.4f} val_bpb:{lawa_val_bpb:.4f}")
 
@@ -1375,6 +1450,7 @@ def main() -> None:
             args.ttt_lr,
             args.ttt_steps,
             args.ttt_params,
+            eval_seq_len=actual_eval_seq_len,
         )
     else:
         q_val_loss, q_val_bpb = eval_val(
@@ -1388,6 +1464,7 @@ def main() -> None:
             base_bytes_lut,
             has_leading_space_lut,
             is_boundary_token_lut,
+            eval_seq_len=actual_eval_seq_len,
         )
     torch.cuda.synchronize()
     ttt_tag = f" ttt_lr:{args.ttt_lr} ttt_steps:{args.ttt_steps} ttt_params:{args.ttt_params}" if args.ttt_enabled else ""
