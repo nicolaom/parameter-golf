@@ -1228,14 +1228,18 @@ def main() -> None:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}"); sys.stdout.flush()
+        log0("warmup done, restoring weights..."); sys.stdout.flush()
         base_model.load_state_dict(initial_model_state, strict=True)
+        log0("weights restored"); sys.stdout.flush()
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
+        log0("optimizers restored"); sys.stdout.flush()
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log0("warmup reset complete, starting training"); sys.stdout.flush()
 
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
