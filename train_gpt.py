@@ -244,68 +244,58 @@ def eval_val(
     is_boundary_token_lut: Tensor,
     eval_seq_len: int = 0,
 ) -> tuple[float, float]:
-    """Sliding window evaluation for better BPB scores."""
+    """Evaluation with optional sliding window for better BPB scores."""
     seq_len = eval_seq_len if eval_seq_len > 0 else args.train_seq_len
     stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
-    raw_model = _unwrap_model(model)
+    use_sliding = (stride < seq_len)
     total_tokens = val_tokens.numel()
-
-    # Build list of window start positions
-    positions: list[int] = []
-    p = 0
-    while p + seq_len < total_tokens:
-        positions.append(p)
-        p += stride
-
-    # Distribute positions across ranks
-    my_positions = positions[rank::world_size]
-
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    raw_model.eval()
+    model.eval()
     with torch.inference_mode():
-        for pos in my_positions:
-            window = val_tokens[pos : pos + seq_len + 1].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = window[:-1].unsqueeze(0)  # (1, seq_len)
-            y = window[1:].unsqueeze(0)   # (1, seq_len)
-
-            # For p==0, score all tokens; for p>0, only last `stride` tokens have maximum context
-            if pos == 0:
-                score_start = 0
-            else:
-                score_start = seq_len - stride
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = raw_model.forward_logits(x)  # (1, seq_len, vocab)
-            logits_scored = logits[:, score_start:, :]
-            targets_scored = y[:, score_start:]
-            loss = F.cross_entropy(
-                logits_scored.reshape(-1, logits_scored.size(-1)).float(),
-                targets_scored.reshape(-1),
-                reduction="sum",
-            )
-            n_scored = targets_scored.numel()
-            val_loss_sum += loss.to(torch.float64)
-            val_token_count += n_scored
-
-            # BPB byte counting for scored tokens
-            prev_ids = x[:, score_start:].reshape(-1)
-            tgt_ids = targets_scored.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
-
+        if use_sliding:
+            raw_model = _unwrap_model(model)
+            positions = list(range(0, total_tokens - seq_len, stride))
+            for pos in positions[rank::world_size]:
+                window = val_tokens[pos : pos + seq_len + 1].to(device=device, dtype=torch.int64)
+                x, y = window[:-1].unsqueeze(0), window[1:].unsqueeze(0)
+                s = 0 if pos == 0 else seq_len - stride
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = raw_model.forward_logits(x)
+                loss = F.cross_entropy(logits[:, s:].reshape(-1, logits.size(-1)).float(), y[:, s:].reshape(-1), reduction="sum")
+                val_loss_sum += loss.to(torch.float64)
+                val_token_count += y[:, s:].numel()
+                prev_ids, tgt_ids = x[:, s:].reshape(-1), y[:, s:].reshape(-1)
+                tb = base_bytes_lut[tgt_ids].to(torch.int16) + (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
+                val_byte_count += tb.to(torch.float64).sum()
+        else:
+            # Fast batched eval using compiled model (no sliding window)
+            total_seqs = (total_tokens - 1) // seq_len
+            seq_start = (total_seqs * rank) // world_size
+            seq_end = (total_seqs * (rank + 1)) // world_size
+            for batch_start in range(seq_start, seq_end, max(1, (seq_end - seq_start) // 16)):
+                batch_end = min(batch_start + max(1, (seq_end - seq_start) // 16), seq_end)
+                raw_start = batch_start * seq_len
+                raw_end = batch_end * seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64)
+                x = local[:-1].reshape(-1, seq_len)
+                y = local[1:].reshape(-1, seq_len)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = model(x, y)
+                n = y.numel()
+                val_loss_sum += batch_loss.to(torch.float64) * n
+                val_token_count += n
+                prev_ids, tgt_ids = x.reshape(-1), y.reshape(-1)
+                tb = base_bytes_lut[tgt_ids].to(torch.int16) + (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
+                val_byte_count += tb.to(torch.float64).sum()
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-
+        for t in (val_loss_sum, val_token_count, val_byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    raw_model.train()
+    model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
