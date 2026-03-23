@@ -264,7 +264,7 @@ def eval_val(
 ) -> tuple[float, float]:
     """Sliding window evaluation for better BPB scores."""
     seq_len = eval_seq_len if eval_seq_len > 0 else args.train_seq_len
-    stride = min(args.eval_stride, seq_len)
+    stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
     raw_model = _unwrap_model(model)
     total_tokens = val_tokens.numel()
 
